@@ -1,48 +1,93 @@
 # dbt-scout 🕵️‍♂️
 
-**A tactical data warehouse utility package designed to audit warehouse hygiene, hunt down clutter, and scout out unmanaged data assets.**
+**Find the tables and views in your Snowflake warehouse that your dbt project no longer builds.**
 
-As analytics environments grow, warehouses naturally collect "data debt"—tables
-and views left behind by deprecated models, ad-hoc queries, or structural
-changes. `dbt-scout` scans warehouse metadata to surface infrastructure
-anomalies and help keep the platform clean, secure, and cost-efficient.
+As a project grows, models get renamed, moved or deleted, and the objects they
+created stay behind. `dbt-scout` lists those leftovers, shows whether anyone
+still queries them, and gives you a `DROP` statement to review.
 
-[📦 dbt Hub](https://getdbt.com) | [🐙 GitHub](https://github.com)
+## What you get
 
----
+The `scout_orphan_objects` model returns one row per orphan: a table, view,
+materialized view, dynamic table or external table that sits in a schema your dbt
+project builds into but is not in the current dbt graph (no model, seed or
+snapshot builds it).
 
-## Key Features
+| Column | Meaning |
+| --- | --- |
+| `full_path`, `database_name`, `schema_name`, `object_name` | Where the object lives. |
+| `object_type` | `table`, `view`, `materialized view`, `dynamic table` or `external table`. |
+| `created_at`, `last_altered_at` | Snowflake timestamps. |
+| `query_count_90d`, `last_accessed_at` | How often the object was queried in the past 90 days. |
+| `cleanup_script` | A suggested `DROP` statement. **It is never run for you.** |
 
-- **Orphan objects (relations) report:** Lists supported relations in schemas
-  used by the dbt project that are not represented in its current dbt graph.
+Only schemas that at least one of your models, seeds or snapshots builds into are
+scanned. A partial run such as `--select` does not create false orphans. Semantic
+views are not detected.
 
-## Orphan Objects (Relations) Report
+## Quick start
 
-The `scout_orphan_objects` model lists supported tables and views in schemas
-used by the dbt project that are not represented by a model, seed, or snapshot
-in its current graph. Each row includes how many queries accessed the relation
-in the past 90 days and a suggested command to drop it. The command is provided
-for review and is never run automatically. Semantic views are not currently
-included.
+1. Add the package to `packages.yml`:
 
-### Install and use
+   ```yaml
+   packages:
+     - git: https://github.com/hmamoun/dbt_scout.git
+       revision: main
+   ```
 
-1. Add the package to your project's `packages.yml`, then run `dbt deps`:
+2. Install it and build the report:
 
-  ```yaml
-  packages:
-    - git: https://github.com/hmamoun/dbt_scout.git
-      revision: main
-  ```
+   ```bash
+   dbt deps
+   dbt run --select scout_orphan_objects
+   ```
 
-2. Add a model to your project that references the report:
+3. Read the result:
 
-  ```sql
-  select * from {{ ref('dbt_scout', 'scout_orphan_objects') }}
-  ```
+   ```sql
+   select * from <your_database>.<your_schema>.scout_orphan_objects
+   order by query_count_90d, created_at;
+   ```
 
-When this model is included in `dbt run` (as it is in a default full-project
-run), dbt rebuilds the report and the model that selects from it. The report
-reflects relations present in the schemas covered by the current dbt graph.
-The package requires a configured Snowflake profile with access to the relevant
-metadata and usage history.
+Objects with `query_count_90d = 0` are the safest candidates to review first.
+
+### Requirements
+
+- Snowflake. The model reads each database's `information_schema` and
+  `snowflake.account_usage.access_history`, so the role that runs dbt needs access
+  to both (for example the `GOVERNANCE_VIEWER` database role on the `SNOWFLAKE`
+  database). Access history needs Snowflake Enterprise Edition or higher and can lag
+  by a few hours.
+- dbt with the `dbt-snowflake` adapter.
+
+### Using it in your project
+
+`scout_orphan_objects` is a table model, so you can run it on demand or on a schedule
+with `dbt run --select scout_orphan_objects`. Two ways to build on it:
+
+**Wrap it in your own model**, so the report is always rebuilt with your project:
+
+```sql
+-- models/governance/orphan_objects.sql
+select * from {{ ref('dbt_scout', 'scout_orphan_objects') }}
+```
+
+**Add a test for CI/CD** that flags leftovers whenever the project runs:
+
+```sql
+-- tests/no_orphan_objects.sql
+{{ config(severity='warn') }}
+
+select * from {{ ref('dbt_scout', 'scout_orphan_objects') }}
+```
+
+```bash
+dbt build --select scout_orphan_objects no_orphan_objects
+```
+
+The test reports a warning for every orphan. Remove the `severity` line to make it
+fail the pipeline instead.
+
+## License
+
+See [LICENSE](LICENSE).
